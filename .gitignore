@@ -1,0 +1,29 @@
+# ---- Credentials ----
+.env
+*.key
+secrets.*
+
+# ---- Raw downloads: large and regenerable ----
+cache/
+*.zip
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ---- Runtime output ----
+query_log.jsonl
+*.log
+
+# ---- OS / editor noise ----
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# data/airports.db is intentionally NOT ignored. It is the aggregated build
+# output and is committed so the application runs without a download step.
