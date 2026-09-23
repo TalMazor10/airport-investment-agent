@@ -1,260 +1,240 @@
 # Design
 
-## Data
+## 1. Summary
 
-### Sources
+The Airport Investment Agent helps analysts at a firm that invests in US airport modernisation
+find airports where renovation would be most profitable. An LLM interprets the analyst's question
+and calls four tools; the tools read a local database built from ten years of US government
+aviation and population data; a deterministic scoring module ranks the airports; the LLM explains
+the result and its assumptions.
 
-All data comes from the US Bureau of Transportation Statistics (BTS), the US Census Bureau and
-OurAirports. US carriers are required by law to report traffic to the Department of
-Transportation, so the record is complete, public and free of licence restrictions. Commercial
-flight trackers were considered and rejected: they are paid, licence-bound, and built for live
-aircraft positions rather than multi-year history.
+The central choice: **the LLM interprets and explains; code computes.** Every figure comes from
+deterministic code, so the same airport always receives the same score and every ranking traces
+to a formula with visible inputs. The public data sources are queried when the database is built,
+not while the agent answers. The LLM provider is a setting: any provider that offers the
+industry-standard chat completions interface works.
 
-| Source | Provides | Access |
-|---|---|---|
-| BTS On-Time Performance | One record per domestic flight by carriers above the BTS revenue threshold: delay minutes by cause, cancellations, departure hour, metropolitan market | Monthly archive files |
-| BTS T-100 Segment (All Carriers) | Every route flown by every carrier, domestic and international, passenger and freighter, with distance and aircraft configuration | TranStats download form |
-| BTS T-100 Segment Summary by Origin Airport | Passengers, seats and departures per airport per month | Open data API, `r495-tyji` |
-| US Census Population Estimates | Annual population per metropolitan area | Flat files |
-| OurAirports | Airport names, cities and coordinates | CSV |
+### Terms used
 
-`prepare_data.py` downloads these sources once, aggregates them to rows per airport per month,
-and writes `data/airports.db`. The database is committed to the repository, so the application
-runs with no credentials and no download step.
-
-### Coverage window: calendar years 2016 to 2025
-
-The sources end in different months:
-
-| Source | Last month published |
+| Term | Meaning |
 |---|---|
-| On-Time Performance | July 2026 |
-| T-100 Segment (All Carriers) | June 2026 |
-| T-100 airport summary | April 2026 |
-| Census population | 2024 |
+| API | Application programming interface: a service that programs query directly |
+| BTS | Bureau of Transportation Statistics, the US Department of Transportation's statistics agency |
+| T-100 | The monthly traffic report every airline must file: flights, passengers and cargo on every route |
+| On-Time Performance | The BTS record of every domestic flight by major airlines, with delay minutes by cause |
+| NAS delay | National Aviation System delay: the BTS category for traffic volume, airport operations, air traffic control and non-extreme weather |
+| FAA, TSA | Federal Aviation Administration; Transportation Security Administration |
+| Metropolitan area | A city and its region. Census publishes its population; BTS groups its airports into one market |
+| LLM | Large language model |
+| Chat completions interface | The request format, originally OpenAI's, that most LLM providers accept |
+| Tool calling | An LLM requesting that a named function be run with given inputs |
+| Load factor | The share of seats sold |
+| Percentile | The share of other airports an airport exceeds on a measure, 0 to 100 |
 
-A partial year compared against a full one shows every airport in decline, so the window ends at
-2025, the last calendar year complete in every flight source. Six months of 2026 carry little
-weight in a decision on infrastructure with a ten-year horizon.
+## 2. Architecture and where AI is used
 
-The pandemic years are handled differently. 2020 and 2021 are complete data that is
-unrepresentative of underlying demand, so discounting them is an analytical judgment. They are
-stored in full and down-weighted month by month in the scoring module, where the weights are
-visible and adjustable. 2026 is removed at build time because it is incomplete, which is a
-coverage fact rather than a judgment. The cutoff remains a build parameter, `--years`.
+```
+question -> app.py -> agent.py  <-- conversation -->  LLM (any provider)
+                         |
+                         | tool calls chosen by the LLM
+                         v
+                      tools.py -> scoring.py -> data/airports.db  <- prepare_data.py (offline)
+```
 
-Census population ends in 2024. Metropolitan areas grow at roughly one percent a year, so 2024
-population stands in for 2025. This is a stated assumption.
-
-### Flight scope: passenger and freighter
-
-The scope widened during design and changed the data layer twice.
-
-1. **Passenger flights only.** The first reading of the brief centred on terminal expansion, and
-   freighters were excluded as irrelevant to passenger terminals.
-2. **Airside included.** The brief's goal is "increased flight and passenger capacity". Flight
-   capacity is airside: towers, taxiways and runways are renovations too, as are ground
-   transport and cargo handling. All flights are therefore in scope.
-3. **A mixed-population error.** The first implementation took domestic flights from On-Time
-   Performance, which excludes freighters, and international flights from a BTS international
-   dataset, which includes them. Anchorage came out at 56.5% long haul. Its largest international
-   operators were Atlas, UPS, FedEx and Kalitta, and it carried only 35,359 international
-   passengers in 2025. The figure mixed two populations and described neither.
-4. **One source for every flight.** BTS T-100 Segment (All Carriers) records every route by every
-   carrier with its aircraft configuration. It replaced both inputs. Every long-haul figure now
-   draws its numerator and denominator from the same population, and passenger and freighter
-   traffic are reported separately.
-
-| Anchorage, 2025 | Long-haul share |
+| File | Role |
 |---|---|
-| All flights | 41.7% |
-| Passenger aircraft | 8.2% |
-| Freighters | 68.3% |
+| `prepare_data.py` | Downloads the public sources once and aggregates them into `data/airports.db`, which holds observations only |
+| `scoring.py` | Every analytical judgment: weights, percentiles, peak gate, sensitivity |
+| `tools.py` | Find airports in a region, score a group, profile one airport, flight distance mix |
+| `agent.py` | A short hand-written loop: send the conversation to the LLM, run the tools it requests, return the results, repeat until it answers (at most ten rounds) |
+| `app.py`, `voice.py` | Chat page with voice dictation |
 
-Anchorage is a long-haul freighter hub and a short-haul passenger airport.
+**The LLM does three things:** it interprets the question (which states make up New England, that
+"LA" means LAX), chooses which tools to call, and explains the result.
 
-On-Time Performance is retained for what only it provides: delay causes, cancellations and
-departure hour. These cover domestic flights by major carriers only. The coverage is consistent
-across airports, so comparisons between airports hold, but it is not any airport's complete
-picture.
+**It never produces a number.** It reaches the data only through the tools, its instructions forbid
+estimating figures, and the tools return every derived figure, including shares, percentages and
+the direction of each score term in words ("Losing 0.29 percentage points of its metropolitan
+area's passenger share a year"). Every answer lists the tool calls behind it, so the LLM's
+interpretation, such as the states it chose, can be checked.
 
-### Long haul: 2,700 statute miles
+## 3. How the brief was interpreted
 
-Long haul conventionally means six hours of flight or more. It is measured here as a route
-distance of 2,700 statute miles or more, which approximates six hours of block time at typical
-jet speeds. A medium band from 1,400 miles is reported alongside, because the threshold is a
-convention and a single percentage hides how much traffic sits just below it.
+The brief invited questions where its definitions were unclear. These definitions were chosen to
+be measurable from public data; they are stated openly, including in the answers, and are open to
+correction.
 
-Measuring six hours directly was tested and rejected. T-100 publishes ramp-to-ramp minutes, but
-only US carriers report them. Foreign carriers record zero.
-
-| Airport, 2025 | By distance, 2,700 miles | By recorded time, 6 hours |
+| Term | Definition used | Why |
 |---|---|---|
-| ANC | 41.7% | 22.5% |
-| JFK | 24.6% | 17.9% |
-| SFO | 16.1% | 5.5% |
-| LAX | 13.7% | 2.8% |
-| BOS | 10.4% | 10.0% |
+| "Most profitable" | Pressure on the airport, combined with its scale; passenger volume stands in for revenue | Airport financial data is not public, and an improvement is worth more at a larger airport |
+| "Renovation" | Terminal and airfield | The goal names flight capacity as well as passenger capacity |
+| "Congestion" | Airfield pressure, scored as NAS delay per arriving flight. Terminal pressure, described but not scored: passengers against the airport's own peak year, busiest departure hours | Load factor was rejected (section 7.1) |
+| "Unmet demand" | Inferred from fingerprints: traffic flat while the region grows, traffic moving to neighbouring airports, traffic delay, more passengers per flight on flat departures | Turned-away demand is never recorded |
+| "Long haul" | A route of 2,700 statute miles or more, about six hours | Flight time is not reported by foreign airlines |
+| "New England", "LA" | Expanded by the LLM into states or airport codes, shown to the user | Hardcoding regions would limit the agent to known ones |
+| Scope | US airports, 2016 to 2025, every airline. Cargo aircraft count in flight and long-haul figures; the score uses passengers and delay | 2025 is the last year complete in every source |
 
-Of the 37,592 LAX departures on routes of 2,700 miles or more, 29,746 (79%) carry no recorded
-flight time, and every one of them is operated by a foreign carrier. A time threshold would have
-classified most international long-haul flights as short haul without raising any error.
-Distance is published for every segment regardless of carrier.
+## 4. Data
 
-### Validation
+US airlines must report their traffic to the government, so the regulator's record is complete,
+public and free to use. Commercial flight trackers were rejected: paid, licence-bound, and built
+for live positions rather than years of history.
 
-Four defects surfaced during development, and none of them raised an error. International
-departures were counted twice because the source reports both directions of each route. Paged API
-queries without a sort order silently dropped two thirds of the international traffic at large
-airports. The Anchorage long-haul figure mixed freighter and passenger populations. Flight time
-is missing for foreign carriers. Each was found by reconciling one figure against an independent
-source, and the test suite makes that reconciliation permanent.
-
-`tests/test_data.py` runs 57 checks against the built database (`pytest -v`).
-
-| Group | Checks |
+| Source | Provides |
 |---|---|
-| Structure | expected tables present and retired tables absent; every table covers exactly 2016 to 2025, population to 2024; no missing months at the airports named in the brief |
-| Consistency | distance bands sum to departures; no negative counts; cancellations never exceed flights; every airport row carries a metropolitan market and a state |
-| Independent sources | route-level totals against the T-100 airport summary, nationally and per airport; stored T-100 row count against the count BTS publishes; On-Time flights never exceed T-100 departures |
-| Known answers | 2025 passengers at LAX, SFO, SNA and ANC; the 2020 collapse, 36.8% below 2019; LAX share of Los Angeles metro flights, 68.9% in 2016 and 61.6% in 2025; the Anchorage long-haul split |
-| Reported | Census match coverage; On-Time coverage of T-100 |
+| BTS T-100 Segment (All Carriers) | Every route flown by every airline, with distance and aircraft type |
+| BTS T-100 airport summary (open data API) | Passengers, seats and departures per airport per month |
+| BTS On-Time Performance | Delay minutes by cause, cancellations, departure hours |
+| US Census population estimates | Annual population per metropolitan area |
+| OurAirports (open database) | Airport names and locations |
 
-Results of the reconciliation checks on the 2016 to 2025 build:
+About 3 GB of raw files become a 25 MB database committed to the repository. The window is 2016 to
+2025: the sources end in different months of 2026, and a partial year compared with a full one
+makes every airport look in decline.
 
-| Check | Tolerance | Result |
-|---|---|---|
-| Route totals against airport totals, national, each year | 0.1% | 2016 to 2023 identical; largest difference 0.006%, in 2025 |
-| The same, per airport-year with 1,000 or more departures | 1% | 4,338 of 4,356 identical; largest difference 0.099% |
-| Stored T-100 rows against the published count | exact | equal |
-| On-Time departed flights against T-100 departures | never greater | highest ratio 1.00, at airports served by one carrier that reports every flight |
+**One source for every flight.** Long-haul shares come from T-100 Segment alone, so each
+percentage takes its numerator and denominator from the same flights. Anchorage shows why this
+matters: 42% of its flights are long haul, but only 8% of its passenger flights are. The long
+flights are cargo planes to and from Asia, and a single percentage would describe neither kind of
+traffic.
 
-Airport-years below 1,000 departures, 8,767 of them carrying 1.7% of all departures, are left out
-of the per-airport reconciliation, where small counts make percentages unstable. They remain in
-the database. The 1% tolerance leaves room for routine BTS revisions without masking a real
-defect; the largest observed difference is a tenth of it.
-
-**Coverage.** Census population matches 238 of 366 airport markets, covering 96.4% of flights. In
-2025, On-Time Performance covers 69.1% of departures at LAX, 75.4% at SFO, 86.9% at SNA and
-21.2% at ANC. The Anchorage figure is low because most of its traffic is freighters and small
-Alaskan carriers, so delay figures there describe a minority of its flights.
-
-### Known data limitations and future improvements
-
-The following were found during validation. None changes the answer to the questions the system
-is built for, so each is recorded rather than resolved; each is a candidate for the next iteration
-once real usage shows which matters most.
-
-- **Census matching is by place name, and partial.** 38 airports above 100,000 passengers, about
-  3% of passengers, have no population reference. Most are in Puerto Rico, Guam, the Virgin
-  Islands, Hawaii's neighbour islands or resort towns, which Census does not classify as
-  metropolitan areas; local population is a weak reference for visitor-driven airports in any
-  case. Four are matching misses: West Palm Beach, Palm Springs, Fort Walton Beach and Redmond.
-  Improvement: resolve the remaining names with a language model at build time, review the
-  result, and write it to the database once, so the query path stays deterministic.
-- **West Palm Beach (PBI) is absent from the OurAirports IATA list**, so it has no name or city
-  in the `airports` table.
-- **Two airports above the ranking threshold, New Haven and Wilmington DE, have no metropolitan
-  market id**, because no On-Time reporting carrier serves them. T-100 Segment publishes a city
-  market id for every airport and could supply it.
-- **Delay data covers domestic flights by major carriers only.** At Anchorage this is 21% of
-  departures.
-- **T-100 Segment is obtained through a web form**, which can change without notice. Every
-  download is cached, so a rebuild from cache does not depend on it.
-
-## Scoring
-
-### What the score measures
-
-The goal is to find airports where renovation would be most profitable through increased flight
-and passenger capacity. The score combines evidence of **pressure**, meaning demand the airport
-struggles to serve, with **scale**, meaning how much traffic an improvement would affect.
-Passenger volume stands in for revenue; no financial data is used.
+## 5. Scoring methodology
 
 | Term | Measure | Weight |
 |---|---|---|
-| Growth gap | Metropolitan population growth minus passenger growth, per year, 2016 to 2025 | 0.20 |
-| Spillover | Trend in the airport's share of its metropolitan area's passengers | 0.20 |
-| NAS delay | National Aviation System delay minutes per arriving flight, 2023 to 2025 | 0.30 |
+| Growth gap | The metropolitan area's population growth minus the airport's passenger growth, per year | 0.20 |
+| Spillover | Trend in the airport's share of its metropolitan area's passengers; losing share counts as pressure | 0.20 |
+| NAS delay | NAS delay minutes per arriving flight, 2023 to 2025 | 0.30 |
 | Scale | Passengers in 2025 | 0.30 |
 
-All arithmetic is in `scoring.py`, in ordinary code. The language model selects which airports to
-score and explains the result, but never produces a number, so the same question always returns
-the same figures.
+- **Growth** is the slope of a trend line through all 120 months on a log scale, seasonal pattern
+  removed, rather than a comparison of two years. Pandemic months count for less (March 2020 half,
+  April and May 2020 at 0.05, rising to full weight by 2022), including toward the 36 months a trend
+  needs. Census population comes in two series, before and after its 2020 recalibration, and growth
+  is measured within each so the recalibration is not read as growth.
+- **Metropolitan areas** are BTS markets, not a distance radius: a radius joining Los Angeles and
+  Santa Ana would also join Los Angeles and San Diego. Each market is matched to its Census area by
+  place name.
+- **NAS delay** is mostly the delay infrastructure can reduce, though it includes ordinary weather.
+  It is counted at the **arrival** airport: when fog cuts San Francisco's arrival rate, inbound
+  flights wait at their origins and the delay is recorded on arrival at San Francisco. Tested
+  against the FAA's own judgment: the seven airports where the FAA restricts (JFK, LaGuardia,
+  Reagan National) or reviews (O'Hare, LAX, Newark, SFO) airline schedules for capacity average the
+  90th percentile of NAS delay when it is counted at arrival, and the 70th at departure.
+- **Percentiles are national**, against every US airport above 100,000 passengers (233), so an
+  airport's score does not depend on which others a question names. Answers show the national
+  score and the rank within the group asked about. The score is the weighted mean, 0 to 100.
+- **Missing terms** are left out, the weights rescaled, and the reason stated. An airport alone in
+  its metropolitan area gets the neutral spillover percentile, 50.
+- **Peak gate.** An airport below 95% of its own busiest year's passengers has already handled more,
+  so a plateau or loss of share there is not counted as evidence of a ceiling; its growth terms take
+  the neutral percentile, and delay can still show strain. 61 of the 233 fall under this line.
+- **Sensitivity.** Every ranking is recomputed with each weight moved by 0.05, and the answer states
+  whether first place or the top three change.
 
-**Load factor was considered and rejected.** Across the 25 largest US airports it spans only 76% to
-83%, because airlines manage it to a revenue target, and it ranks Nashville, one of the fastest
-growing markets in the country, last.
+## 6. Answers to the four questions
 
-### How each term is computed
+Figures as the tools return them.
 
-- **Growth rates** are the slope of a trend line through the 120 monthly passenger totals, on a
-  log scale so the slope reads as percent per year, with the seasonal pattern removed. Pandemic
-  months count for less: March 2020 at half weight, April and May 2020 at 0.05, rising through
-  2021 to full weight in 2022. A trend needs 36 months of data, counted by weight.
-- **Growth gap** compares that rate with the metropolitan area's population trend. Census
-  population ends in 2024. Air travel does not scale linearly with population, so the gap is a
-  relative signal between airports, not an absolute measure of unmet demand.
-- **Spillover** tracks the airport's share of all passengers in its metropolitan area, using the
-  BTS city market grouping rather than a distance radius. A radius large enough to join Los
-  Angeles and Santa Ana would also join Los Angeles and San Diego.
-- **NAS delay** is the delay category BTS assigns to airport operations, traffic volume and air
-  traffic control, the delay that infrastructure can reduce. It is attributed to the **arrival**
-  airport. BTS records delay causes on arrival, and traffic management acts at the constrained
-  end: when fog cuts San Francisco's arrival rate, flights bound for SFO wait at their origins
-  and the delay is recorded on arrival into SFO. Counting it at the origin would charge SFO's
-  congestion to dozens of other airports. **Tested:** the seven airports where the FAA limits
-  scheduled traffic for capacity (JFK, LaGuardia, Reagan National, O'Hare, LAX, Newark, SFO)
-  average the 90th percentile under arrival attribution and the 70th under departure attribution.
+- **New England, terminal expansion.** Boston first (72.4, 19th nationally), then Bradley (68.3) and
+  Providence (61.7), stable under every weight change. Boston has the region's heaviest airfield
+  delay (5.1 minutes per arriving flight, 96th percentile) and its largest traffic.
+- **LA and Santa Ana, congestion.** LAX has more airfield delay (2.1 against 1.6 minutes per
+  arrival). Santa Ana has the tighter terminal: it runs at 97% of its busiest year, LAX at 85% of its
+  2019 peak. LAX is losing 0.9 percentage points of the region's passengers a year to its neighbours,
+  but since it is below its own peak, that reads as passengers choosing other airports rather than a
+  full LAX.
+- **Long haul from Anchorage.** 41.7% of all 2025 departures: 8.2% of passenger flights and 68.3% of
+  cargo flights, which are 56% of the total.
+- **Unmet demand at SFO, and why.** Inferred from its fingerprints: some of the heaviest airfield
+  delay in the country (5.7 minutes per arrival, 99th percentile), and airlines fitting more
+  passengers onto fewer flights, with departures down from 218,000 in 2018 to 190,000 in 2025 while
+  passengers per departure rose from 129 to 139. That is what airlines do when they cannot add
+  flights. SFO scores 78.4, fifth nationally.
 
-### From measures to a score
+## 7. What went wrong and what it taught
 
-- **Percentiles against the whole country.** Each term becomes a percentile against every US
-  airport above 100,000 passengers in 2025, 233 airports. An airport's score is therefore the
-  same whichever airports a question names. Ranking within the requested group alone would give
-  one of two airports 100 and the other 0 on every term, and would call the best of a weak region
-  "strong". Answers show both: the national score and the rank within the group.
-- **The score** is the weighted mean of the term percentiles, from 0 to 100.
-- **Missing terms** are left out and the remaining weights rescaled, and the answer states which
-  term is missing and why. The main case is an airport with no Census population match.
-- **An airport alone in its metropolitan area** receives the neutral spillover percentile, 50.
-  There is no neighbouring airport for traffic to move to, so spillover neither raises nor lowers
-  it, and the other terms decide.
-- **Peak gate.** An airport carrying less than 95% of the passengers of its own busiest year has
-  already handled more traffic than it carries now. A plateau or a share loss there indicates lost
-  demand, not a ceiling, so growth gap and spillover take the neutral percentile. Raw values are
-  still reported.
-- **Computed live.** Scores are computed from the database when first requested and held in memory.
-  Changing a weight takes effect on the next question, with no rebuild.
+### 7.1 How the design evolved
 
-### The first model rewarded decline
+| Question | First idea | What showed it was wrong | What replaced it |
+|---|---|---|---|
+| Where does the data come from? | Live flight trackers | Investors need years of trend, not today's positions; trackers are paid and licence-bound | The regulator's records, found by asking who is legally required to publish them |
+| Who calculates the ranking? | The LLM | A ranking that changes between identical questions cannot back an investment or be audited | Deterministic code |
+| How is congestion measured? | Load factor | Across the 25 largest airports it spans only 76% to 83%, and it ranked Nashville, a fast-growing market, last | NAS delay, and passengers against the airport's own peak |
+| How is capacity known? | FAA capacity figures | The FAA site blocked automated downloads | A ceiling inferred from traffic: flat while the region grows, or lost to neighbours |
+| How is spillover measured? | Neighbours' growth minus the airport's | Wrong whenever a whole region grows or shrinks together | The airport's share of its region's passengers over time |
+| Which flights count? | Passenger flights only | Runways serve cargo aircraft too; mixing sources then caused the Anchorage error (7.2) | Every airline, one source, split by aircraft type |
+| Does delay belong in the score? | No: it can reflect airline management | BTS splits delay by cause, and NAS delay is the part infrastructure can fix | Included, counted at the arrival airport |
+| Against whom is an airport ranked? | The airports in the question | Two airports always score 0 and 100; a weak region still yields a "strong" candidate | Every airport nationally |
+| What tools does the LLM get? | One per sample question | Could not answer a fifth question | Four tools, one per kind of request |
+| Which LLM provider? | One provider's library | The firm's provider is unknown | The industry-standard interface |
 
-The first version of the score passed every test and still produced wrong answers. Checking its
-output against airports with known histories exposed the problem:
+### 7.2 Defects caught by verification
 
-| | First model | Current model |
+None raised an error; each produced a plausible number.
+
+| Defect | How it was found | Fix | Lesson |
+|---|---|---|---|
+| International flights counted twice (the source lists both directions), then two thirds of LAX's lost by a page-by-page query without a fixed order | Totals did not match the T-100 airport summary | One source for every route | Reconcile against an independent source |
+| Anchorage long haul at 56.5%, mixing cargo and passenger flights | Its main international airlines were Atlas, UPS, FedEx and Kalitta; it had 35,359 international passengers all year | Split by aircraft type | A percentage needs one population |
+| **The first score rewarded decline:** Manchester, losing 5.4% of passengers a year, above Boston; Oakland above San Francisco | Reading answers against known airports, with every test passing | The peak gate and a larger NAS delay weight, after simulating four options | Tests prove code matches design, not that the design is right |
+| Census population half-missing for renamed areas (45 airports, 42% of passengers), and the 2020 recalibration read as growth, reversing 49 of 231 trends | A live answer said Denver's data ended in 2019; a test failed after that fix | Join on area code; measure growth within each series | Check every record; a failing test after a fix can be the data revealing more |
+| The LLM explained correct numbers wrongly: JFK "gaining" share it was losing; SFO's delay, at the 99th percentile nationally, called "moderate"; shares calculated itself | Reading answers against tool output | Directions written in words by code; national percentiles and shares returned by the tools | Give the LLM meaning, not raw values, and nothing to calculate. A rule that fixes one answer can break another, so every change is retested on all four questions |
+
+## 8. Key tradeoffs
+
+| Chosen | Gained | Given up |
 |---|---|---|
-| New England, top three | Providence, Bradley, **Manchester** | **Boston**, Bradley, Providence |
-| Bay Area, first | **Oakland** | **SFO** |
-| Akron-Canton, national rank | **10th** | 82nd |
+| Build the data once and commit it | Instant answers; runs with only an LLM key | Freshness: a snapshot to December 2025 |
+| Arithmetic in deterministic code | Reproducible, auditable figures | Rescoring under weights an analyst invents mid-conversation |
+| National percentiles | Stable scores; meaningful two-airport comparisons | A purely regional view |
+| A trend line through every month | One unusual year cannot decide | The simplicity of comparing two years |
+| A hand-written agent loop | Every step visible and logged | Conveniences of ready-made helpers |
+| The standard chat interface | Any LLM provider | Provider-specific features |
+| Browser speech recognition | Nothing to install, no second key | Chrome and Edge only; audio processed by the browser maker |
 
-Manchester's passengers fall 5.4% a year, Oakland's 3.3%, Akron-Canton's 5.7%. The growth gap
-widens whenever passengers fall, so an airport that demand has abandoned scored like one that is
-full. Spillover had the same weakness. Two changes corrected it: the peak gate, and a larger NAS
-delay weight, raised from 0.15 to 0.30, because delay is what separates a full airport from an
-abandoned one.
+## 9. Assumptions, uncertainty and scope
 
-It also changed one interpretation. LAX carries 85% of its 2019 passengers, so its loss of share to
-Santa Ana, Burbank and Long Beach is not evidence that LAX is full: passengers chose other airports
-while LAX still had room. The share loss is reported; it no longer raises the score.
+- Passenger volume stands in for revenue; no financial data is used.
+- Unmet demand is inferred, never observed. Air travel does not scale linearly with population, so
+  the growth gap is a relative signal.
+- More passengers per flight partly reflects airlines retiring small regional jets everywhere.
+- Delay covers domestic flights by major airlines only (69% of LAX's departures, 21% of
+  Anchorage's) and includes ordinary weather.
+- Census population ends in 2024 and stands in for 2025. 238 of 366 BTS markets match a Census area,
+  covering 96.4% of flights; seven areas Census redefined in 2023 are scored without a growth gap.
+- The weights are judgments, chosen partly by checking results against known airports, which risks
+  tuning to expectations. Every ranking reports whether it survives a 0.05 change in any weight.
+- The ranking correlates 0.74 with a ranking by passengers alone: size matters, but 8 of the top 20
+  differ.
+- Long haul is a convention; a medium band from 1,400 miles is reported alongside it.
+- Data ends in December 2025. No forecasts; US airports only.
 
-### Sensitivity
+## 10. Validation
 
-The weights are judgments. Every ranking is recomputed with each weight moved up and down by 0.05,
-the others rescaled, and the answer reports whether the first place or the top three change. A
-ranking that survives is stated as stable; one that does not is reported with the change that
-moves it. The New England ranking is stable under every such change.
+120 automated tests cover the data, the scoring, the tools, the agent loop (with a scripted
+stand-in for the LLM) and the chat page. They need no API key and run on every push, on Python
+3.10 and 3.14. The database is reconciled against independent sources:
 
-`tests/test_scoring.py` runs 24 checks on the arithmetic, the scoring rules and the design
-decisions above, including the FAA attribution test and the corrected answers for New England
-and the Bay Area.
+| Check | Tolerance | Result |
+|---|---|---|
+| Route totals against the T-100 airport summary, nationally, each year | 0.1% | 2016 to 2023 identical; largest difference 0.006% |
+| The same per airport and year, 1,000 departures or more | 1% | 4,338 of 4,356 identical; largest difference 0.099% |
+| Stored rows against the count BTS publishes | exact | equal |
+
+Twenty questions beyond the brief's four, covering unseen regions, follow-ups, forecasts and
+out-of-scope requests, were run and read against the tool output. That review found the last two
+defects in 7.2 and cut the median answer from 454 words to about 185. The application was also
+tested by hand, including voice.
+
+## 11. With more time
+
+- A gradual peak discount instead of the hard 95% line, which SFO (94.4%) and LAX fall just under.
+- Pressure multiplied by scale rather than added, so a large, uncongested airport cannot score on
+  size alone.
+- The investment side: construction cost, how US airports are financed, projects already funded.
+- The FAA's published capacity figures, to test the inferred ceiling, and TSA checkpoint throughput,
+  a direct measure of terminal pressure.
+- Analyst-chosen scenario weights, and uncertainty in each trend slope, not only in the weights.
+- A monthly rebuild, an automatically graded set of test questions, a hosted instance with a
+  spending cap, and a local model through Ollama once its tool selection is measured.

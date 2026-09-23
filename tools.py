@@ -118,9 +118,47 @@ def find_airports(states, include_small=False):
 # score_airports
 # ----------------------------------------------------------------------------
 
+def _reading(term, raw, context):
+    """One sentence stating what a term's value means, direction included.
+
+    Written by code so the model relays the direction rather than inferring it
+    from a sign or a percentile. For spillover the percentile runs opposite to
+    the raw value: losing share is the pressure signal and scores high.
+    """
+    if raw is None:
+        return None
+    if term == "growth_gap":
+        pax, pop = context["passenger_growth"], context["population_growth"]
+        rates = f"(passengers {pax * 100:+.2f}% a year, metropolitan population {pop * 100:+.2f}% a year)"
+        if raw > 0:
+            return (f"Population of its metropolitan area grew {raw:.2f} percentage points a year "
+                    f"faster than its passengers {rates}.")
+        return (f"Passengers grew {-raw:.2f} percentage points a year faster than the population "
+                f"of its metropolitan area {rates}.")
+    if term == "spillover":
+        if raw < 0:
+            return f"Losing {-raw:.2f} percentage points of its metropolitan area's passenger share a year."
+        if raw > 0:
+            return f"Gaining {raw:.2f} percentage points of its metropolitan area's passenger share a year."
+        return "Holding a steady share of its metropolitan area's passengers."
+    if term == "nas_delay":
+        return f"{raw:.2f} minutes of NAS delay per arriving flight, 2023 to 2025."
+    return f"{int(raw):,} passengers in {scoring.LAST_YEAR}."
+
+
+def _sensitivity_summary(s):
+    top = ", ".join(s["top_in_rank_order"])
+    if s["stable"]:
+        return (f"Stable: moving any single weight by {s['step']} leaves {s['first']} first "
+                f"and the top positions unchanged ({top}, in rank order).")
+    shifts = "; ".join(f"with the {c['term']} weight at {c['weight']}, the order becomes "
+                       f"{', '.join(c['top_in_rank_order'])}" for c in s["changes"])
+    return f"Not stable. Current order {top}. {shifts}."
+
+
 TERM_UNITS = {
-    "growth_gap": "percentage points per year (metro population growth minus passenger growth)",
-    "spillover": "percentage points of metro passenger share per year",
+    "growth_gap": "percentage points per year (metropolitan population growth minus passenger growth)",
+    "spillover": "percentage points of metropolitan-area passenger share per year",
     "nas_delay": "NAS delay minutes per arriving flight, 2023 to 2025",
     "scale": f"passengers in {scoring.LAST_YEAR}",
 }
@@ -158,9 +196,10 @@ def score_airports(airports):
                 "national_rank": r["national_rank"], "national_pool": r["national_pool"],
             })
             item["terms"] = {
-                t: {"value": _round(v["raw"], 2) if t != "scale" else int(v["raw"]),
+                t: {"reading": _reading(t, v["raw"], c),
+                    "value": _round(v["raw"], 2) if t != "scale" else int(v["raw"]),
                     "unit": TERM_UNITS[t],
-                    "percentile": _round(v["percentile"]),
+                    "percentile": None if v["percentile"] is None else round(v["percentile"]),
                     "effective_weight": round(v["weight"], 3)}
                 for t, v in r["terms"].items()
             }
@@ -174,19 +213,52 @@ def score_airports(airports):
                                    f"{scoring.MIN_PASSENGERS:,} passengers in {scoring.LAST_YEAR}"
                                    if ranked_codes else None,
             "score_range": "0 to 100, weighted mean of term percentiles",
+            "percentile_direction": "every percentile is oriented so that higher means a "
+                                    "stronger renovation case: metropolitan population growing "
+                                    "faster than passengers, more metropolitan-area share lost, more NAS delay, "
+                                    "more passengers",
+            "reading": "each term's reading states its direction in words; the sign of the "
+                       "value is not a guide on its own",
             "peak_gate": f"below {scoring.PEAK_GATE:.0%} of its peak-year passengers, growth gap "
                          "and spillover are neutral (50)",
         },
         "airports": out,
     }
     if len(ranked_codes) >= 2:
-        result["sensitivity"] = scoring.sensitivity(ranked_codes)
+        s = scoring.sensitivity(ranked_codes)
+        result["sensitivity"] = {**s, "summary": _sensitivity_summary(s)}
     return result
 
 
 # ----------------------------------------------------------------------------
 # airport_profile
 # ----------------------------------------------------------------------------
+
+def _nas_delay_comparison(airport):
+    """An airport's NAS delay, 2023 to 2025, set against every ranked airport.
+
+    Minutes alone do not show whether delay is high: 5.5 minutes can look modest
+    beside an airport's own worse years while ranking near the top nationally.
+    The national percentile and median make the comparison explicit.
+    """
+    table = scoring.national_table("arrival")
+    rec = table.get(airport)
+    if not rec or "nas_delay" not in rec["raw"]:
+        return None
+    ranked = sorted(r["raw"]["nas_delay"] for r in table.values()
+                    if r["ranked"] and "nas_delay" in r["raw"])
+    mid = len(ranked) // 2
+    median = ranked[mid] if len(ranked) % 2 else (ranked[mid - 1] + ranked[mid]) / 2
+    pct = rec.get("percentile", {}).get("nas_delay") if rec["ranked"] else None
+    return {
+        "minutes_per_arrival_2023_2025": _round(rec["raw"]["nas_delay"], 2),
+        "national_percentile": None if pct is None else round(pct),
+        "national_median_minutes": _round(median, 2),
+        "reading": (f"More NAS delay than {round(pct)}% of US airports above "
+                    f"{scoring.MIN_PASSENGERS:,} passengers." if pct is not None
+                    else "Not ranked: below the passenger threshold."),
+    }
+
 
 def airport_profile(airport):
     """Facts about one airport, year by year, with no scoring."""
@@ -266,6 +338,7 @@ def airport_profile(airport):
             for cause, total in zip(("carrier", "weather", "nas", "security", "late_aircraft"),
                                     causes[1:])
         } if arrivals_latest else None,
+        "nas_delay_national_comparison": _nas_delay_comparison(a),
         f"busiest_departure_hours_{scoring.LAST_YEAR}": [
             {"hour": blk, "share_of_daily_departures_pct": _pct(n / total_hours)}
             for blk, n in hours[:3]
@@ -277,7 +350,7 @@ def airport_profile(airport):
                 f"{_pct(ontime_latest / latest_deps) if latest_deps else 'n/a'}% of this airport's "
                 f"{scoring.LAST_YEAR} departures"),
             "population": "Census metropolitan estimates, 2016 to 2024" if mkt in d["population"]
-                          else "no Census population match for this airport's metro area",
+                          else "no Census population match for this airport's metropolitan area",
         },
     }
 
@@ -287,7 +360,7 @@ def airport_profile(airport):
 # ----------------------------------------------------------------------------
 
 def haul_mix(airport, year=scoring.LAST_YEAR):
-    """Departures by distance band, for all flights, passenger aircraft and freighters."""
+    """Departures by distance band, for all flights, passenger aircraft and cargo aircraft."""
     a = airport.strip().upper()
     year = int(year)
     con = _connect()
@@ -298,11 +371,14 @@ def haul_mix(airport, year=scoring.LAST_YEAR):
     if not rows:
         return {"airport": a, "year": year, "error": "no route data for this airport and year"}
 
+    total = sum(r[1] for r in rows)
+
     def band(selected):
         deps, long_, med, short = (sum(r[i] for r in selected) for i in range(1, 5))
         if not deps:
             return None
         return {"departures": deps,
+                "share_of_all_departures_pct": _pct(deps / total),
                 "long_haul_pct": _pct(long_ / deps), "medium_haul_pct": _pct(med / deps),
                 "short_haul_pct": _pct(short / deps)}
 
@@ -311,7 +387,7 @@ def haul_mix(airport, year=scoring.LAST_YEAR):
         "year": year,
         "all_flights": band(rows),
         "passenger_aircraft": band([r for r in rows if r[0] == PASSENGER_AIRCRAFT]),
-        "freighters": band([r for r in rows if r[0] == FREIGHTER]),
+        "cargo_aircraft": band([r for r in rows if r[0] == FREIGHTER]),
         "other_aircraft": band([r for r in rows if r[0] not in (PASSENGER_AIRCRAFT, FREIGHTER)]),
         "definitions": {
             "long_haul": f"route distance of {LONG_HAUL_MILES:,} statute miles or more, "
@@ -359,8 +435,8 @@ TOOL_DEFINITIONS = [
             "Score and rank a group of airports as renovation candidates. This is the only source "
             "of scores and rankings; never estimate one. Each airport gets a national score from 0 "
             "to 100, its rank within the group and nationally, and four terms with raw values, "
-            "percentiles and notes: growth gap (metro population growing faster than passengers), "
-            "spillover (losing passenger share to other airports in the same metro), NAS delay "
+            "percentiles and notes: growth gap (metropolitan population growing faster than passengers), "
+            "spillover (losing passenger share to other airports in the same metropolitan area), NAS delay "
             "(traffic and airport-operations delay per arriving flight) and scale (passengers). "
             "Notes explain any term that is missing or neutral. For two or more ranked airports "
             "the result includes a sensitivity check: whether the top positions change when any "
@@ -382,7 +458,9 @@ TOOL_DEFINITIONS = [
             f"departure for each year {scoring.FIRST_YEAR} to {scoring.LAST_YEAR}; its share of its "
             "metropolitan area's passengers each year; its peak year and how close it now is to "
             "it; cancellation rate and NAS delay per arrival each year; delay minutes by cause; its "
-            "busiest departure hours; the other airports in its metro area; and metro population. "
+            "busiest departure hours; the other airports in its metropolitan area; and that area's population. "
+            "It also gives the airport's 2023 to 2025 NAS delay with its national percentile and "
+            "the national median; judge whether delay is high from the percentile, not the minutes. "
             "Use it to explain why an airport looks congested or constrained, to compare "
             "congestion between airports, or to describe demand. Passengers per departure rising "
             "while departures stay flat indicates airlines using larger aircraft rather than adding "
@@ -400,10 +478,10 @@ TOOL_DEFINITIONS = [
         "name": "haul_mix",
         "description": (
             "Share of an airport's departures that are long, medium and short haul, for all "
-            "flights, passenger aircraft only and freighters only, domestic and international, "
+            "flights, passenger aircraft only and cargo aircraft only, domestic and international, "
             f"every carrier. Long haul is a route of {LONG_HAUL_MILES:,} statute miles or more, about six hours. "
             "Use it for questions about long-haul flights or the kind of traffic an airport serves. "
-            "Report the passenger and freighter split, not only the total: at cargo hubs they "
+            "Report the passenger and cargo aircraft split, not only the total: at cargo hubs they "
             "differ sharply."
         ),
         "input_schema": {

@@ -217,3 +217,16 @@ def test_report_national_top_15():
               f"gap {fmt(t['growth_gap']['percentile'])}  spill {fmt(t['spillover']['percentile'])}  "
               f"nas {fmt(t['nas_delay']['percentile'])}  scale {fmt(t['scale']['percentile'])}")
     assert not any(math.isnan(r["score"]) for r in scoring.score(everyone))
+
+
+def test_sensitivity_lists_the_top_positions_in_rank_order():
+    ranked = [r["airport"] for r in scoring.score(NEW_ENGLAND) if r.get("ranked")]
+    assert scoring.sensitivity(NEW_ENGLAND)["top_in_rank_order"] == ranked[:3]
+
+
+def test_population_growth_ignores_the_2020_census_rebase():
+    """A series growing 1% a year that steps up 4% at 2020, as New York's does
+    when Census switches to 2020-based estimates, still reads as 1% a year."""
+    points = [(y, 1_000_000 * 1.01 ** (y - 2016) * (1.04 if y >= 2020 else 1.0))
+              for y in range(2016, 2025)]
+    assert scoring.annual_growth(points) == pytest.approx(0.01, abs=1e-9)

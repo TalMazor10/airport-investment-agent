@@ -33,17 +33,20 @@ percentiles, from 0 to 100.
 
 A term that cannot be computed is left out, the remaining weights are
 rescaled to sum to one, and the result records which term is missing and why.
+The growth gap requires the full 2016 to 2024 population series; a partial
+series would compare population and traffic over different periods.
 An airport alone in its metropolitan area receives the neutral spillover
 percentile, 50: there is no neighbouring airport for traffic to move to, so
 spillover neither raises nor lowers it.
 
 Peak gate. Falling traffic widens the growth gap and lowers an airport's share
-of its metro, so without a guard an airport that demand has abandoned scores
+of its metropolitan area, so without a guard an airport that demand has abandoned scores
 like one that is full. An airport carrying less than PEAK_GATE of the
 passengers of its own busiest year has already handled more traffic than it
-carries now, so a plateau or share loss there indicates lost demand, not a
+carries now, so a plateau or share loss there is not counted as evidence of a
 ceiling. For those airports growth gap and spillover take the neutral
-percentile. Their raw values are still reported.
+percentile. Their raw values are still reported, and delay can still show
+strain.
 
 Growth rates are slopes of a trend line fitted through every month of the
 window on a log scale, with calendar-month effects removed and each month
@@ -81,6 +84,8 @@ TERM_WEIGHTS = {
 
 MIN_PASSENGERS = 100_000        # airports below this in LAST_YEAR are reported, not ranked
 FIRST_YEAR, LAST_YEAR = 2016, 2025
+LAST_POPULATION_YEAR = 2024     # Census publishes nothing later
+CENSUS_REBASE_YEAR = 2020       # first year of estimates based on the 2020 census
 NAS_YEARS = (2023, 2025)        # inclusive
 PEAK_GATE = 0.95                # share of its own peak-year passengers; below this, no ceiling
 MIN_MONTHS_FOR_TREND = 36       # months of data needed for a trend, each counted by its weight
@@ -159,13 +164,26 @@ def trend_slope(rows, log):
 
 
 def annual_growth(points):
-    """Growth rate per year of a trend line through (year, value) points, log scale."""
+    """Growth rate per year of a trend line through yearly population, log scale.
+
+    Census bases its 2010 to 2019 estimates on the 2010 census and its later
+    estimates on the 2020 census, and the two series do not meet: New York
+    steps up 4 percent between 2019 and 2020 because the 2020 count exceeded
+    the projection, not because the population grew. A single line across the
+    step would read the correction as growth. The line is therefore allowed one
+    step at CENSUS_REBASE_YEAR, and only growth within each series is measured.
+    """
     points = [(y, v) for y, v in points if v and v > 0]
     if len(points) < 2:
         return None
     years = np.array([y for y, _ in points], dtype=float)
-    slope = np.polyfit(years, np.log([v for _, v in points]), 1)[0]
-    return math.exp(slope) - 1
+    columns = [np.ones_like(years), years]
+    after = years >= CENSUS_REBASE_YEAR
+    if after.any() and not after.all():
+        columns.append(after.astype(float))
+    coef, *_ = np.linalg.lstsq(np.column_stack(columns), np.log([v for _, v in points]),
+                               rcond=None)
+    return math.exp(coef[1]) - 1
 
 
 def percentiles(values):
@@ -294,6 +312,11 @@ def national_table(nas_attribution="arrival"):
             rec["notes"]["growth_gap"] = "no Census population match for its metropolitan area"
         elif ctx["passenger_growth"] is None:
             rec["notes"]["growth_gap"] = "too few months of passenger data for a trend"
+        elif _population_years(d["population"][mkt]) != set(range(FIRST_YEAR, LAST_POPULATION_YEAR + 1)):
+            years = sorted(_population_years(d["population"][mkt]))
+            rec["notes"]["growth_gap"] = (
+                f"Census population covers only {years[0]} to {years[-1]} for this metropolitan area, "
+                "which Census redefined in 2023; no comparable population trend")
         else:
             ctx["population_growth"] = annual_growth(d["population"][mkt])
             rec["raw"]["growth_gap"] = 100 * (ctx["population_growth"] - ctx["passenger_growth"])
@@ -344,9 +367,14 @@ def national_table(nas_attribution="arrival"):
                 if term in table[a]["percentile"]:
                     table[a]["percentile"][term] = NEUTRAL_PERCENTILE
                     table[a]["notes"][term] = (
-                        f"carries {share:.0%} of its {peak_year[a]} peak passengers, so a "
-                        f"plateau or share loss indicates lost demand, not a ceiling; neutral score")
+                        f"carries {share:.0%} of its {peak_year[a]} peak passengers, below the "
+                        f"{PEAK_GATE:.0%} threshold, so a plateau or share loss is not counted as "
+                        f"evidence of a ceiling; neutral score")
     return table
+
+
+def _population_years(points):
+    return {y for y, p in points if p}
 
 
 def _weighted_score(rec, weights):
@@ -430,11 +458,11 @@ def sensitivity(airports):
     Each weight is raised and lowered by SENSITIVITY_STEP in turn, with the
     others rescaled so the weights still sum to one. The result lists every
     change that alters the first place or the membership of the top
-    SENSITIVITY_TOP_N.
+    SENSITIVITY_TOP_N. Top positions are listed in rank order.
     """
     def top(weights):
         order = [r["airport"] for r in score(airports, weights) if r.get("ranked")]
-        return order[0] if order else None, set(order[:SENSITIVITY_TOP_N])
+        return order[0] if order else None, order[:SENSITIVITY_TOP_N]
 
     base_first, base_top = top(TERM_WEIGHTS)
     changes = []
@@ -444,13 +472,13 @@ def sensitivity(airports):
             rest = sum(v for t, v in TERM_WEIGHTS.items() if t != term)
             trial = {t: (new_w if t == term else v * (1 - new_w) / rest)
                      for t, v in TERM_WEIGHTS.items()}
-            first, top_set = top(trial)
-            if first != base_first or top_set != base_top:
+            first, top_order = top(trial)
+            if first != base_first or set(top_order) != set(base_top):
                 changes.append({"term": term, "weight": round(new_w, 3),
-                                "first": first, "top": sorted(top_set)})
+                                "first": first, "top_in_rank_order": top_order})
     return {
         "first": base_first,
-        "top": sorted(base_top),
+        "top_in_rank_order": base_top,
         "stable": not changes,
         "step": SENSITIVITY_STEP,
         "changes": changes,

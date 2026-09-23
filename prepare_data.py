@@ -11,7 +11,7 @@ Sources, all public domain US government or Unlicense:
                                      delays, cancellations, departure hour
     BTS T-100 Segment (All Carriers) every route flown by every carrier,
                                      domestic and international, passenger and
-                                     freighter, with distance and aircraft
+                                     cargo aircraft, with distance and aircraft
                                      configuration
     BTS T-100 Segment Summary        passengers, seats and departures per
       by Origin Airport              airport per month
@@ -261,7 +261,7 @@ def aggregate_month(zip_path):
     """Stream one monthly On-Time zip and return three aggregates.
 
     by_origin : per departing airport: flights, cancellations, diversions,
-                delay minutes by cause, metro market and state.
+                delay minutes by cause, metropolitan market and state.
     by_dest   : per arriving airport, delay causes only. The BTS delay-cause
                 columns describe ARRIVAL delay, so grouping them by origin
                 attributes congestion at the destination to the wrong airport.
@@ -326,10 +326,10 @@ def aggregate_segments(zip_path):
 
     AIRCRAFT_CONFIG is stored as the code BTS publishes:
         1  passenger
-        2  freighter
+        2  cargo aircraft (freight configuration)
         3  combined passenger and freight on the main deck
         4  seaplane
-    Grouping codes into passenger and freighter service is left to the code
+    Grouping codes into passenger and cargo service is left to the code
     that reads the database, so the stored figures remain exactly as reported.
 
     Only departures from US airports are kept. The source also lists segments
@@ -450,42 +450,52 @@ def fetch_metro_population(market_cities, years):
     differently or does not classify as metropolitan areas. Unmatched markets
     have no population record in the database.
 
+    The two Census files are joined on the CBSA code, not the name. Census
+    renamed many metropolitan areas under its 2023 definitions (for example
+    Denver-Aurora-Lakewood became Denver-Aurora-Centennial) while keeping their
+    codes. Joined by name, each renamed area splits into two entries holding
+    half the series each. Every name an area has carried is used for matching,
+    and the most recent name is stored.
+
     market_cities: {city_market_id: (city, state_code)}
     years:         years to keep; Census publishes nothing after 2024
     returns: {city_market_id: {"cbsa": name, "pop": {year: population}}}
     """
     wanted = set(years)
-    metros = {}
+    metros = {}   # CBSA code -> {"names": [oldest first], "pop": {year: population}}
     for url, census_years in CENSUS_URLS:
         r = requests.get(url, timeout=180)
         r.raise_for_status()
         for row in csv.DictReader(io.StringIO(r.text)):
             if row.get("LSAD") != "Metropolitan Statistical Area":
                 continue
-            name = row["NAME"]
-            pops = {y: int(row[f"POPESTIMATE{y}"])
-                    for y in census_years
-                    if y in wanted and (row.get(f"POPESTIMATE{y}") or "").isdigit()}
-            metros.setdefault(name, {}).update(pops)
+            area = metros.setdefault(row["CBSA"], {"names": [], "pop": {}})
+            if row["NAME"] not in area["names"]:
+                area["names"].append(row["NAME"])
+            area["pop"].update({y: int(row[f"POPESTIMATE{y}"])
+                                for y in census_years
+                                if y in wanted and (row.get(f"POPESTIMATE{y}") or "").isdigit()})
 
     index = []
-    for name in metros:
-        head, states = name.rsplit(",", 1)
-        index.append((name, _normalise_place(head), set(states.strip().split("-"))))
+    for code, area in metros.items():
+        for name in area["names"]:
+            head, states = name.rsplit(",", 1)
+            index.append((code, _normalise_place(head), set(states.strip().split("-"))))
 
     out = {}
     for market, (city, state) in market_cities.items():
         # OurAirports cities may carry a qualifier after a comma, e.g. "Honolulu, Oahu".
         tokens = [_normalise_place(t).strip() for t in re.split(r"[-/,]", city) if t.strip()]
         best = None
-        for name, head, states in index:
+        for code, head, states in index:
             if state not in states:
                 continue
             if any(t and t in head for t in tokens):
                 if best is None or len(head) < len(best[1]):
-                    best = (name, head)
+                    best = (code, head)
         if best:
-            out[market] = {"cbsa": best[0], "pop": metros[best[0]]}
+            area = metros[best[0]]
+            out[market] = {"cbsa": area["names"][-1], "pop": area["pop"]}
     return out
 
 

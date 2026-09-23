@@ -239,7 +239,7 @@ def test_2020_shows_the_pandemic_collapse(db):
 
 
 def test_lax_loses_share_of_its_metro_market(db):
-    """LAX carried 68.9 percent of Los Angeles metro flights in 2016 and 61.6
+    """LAX carried 68.9 percent of Los Angeles metropolitan-area flights in 2016 and 61.6
     percent in 2025: the spillover fingerprint."""
     def lax_share(year):
         lax, metro = db.execute("""
@@ -255,7 +255,7 @@ def test_lax_loses_share_of_its_metro_market(db):
 
 
 def test_anchorage_2025_long_haul_split(db):
-    """Anchorage is a long-haul freighter hub and a short-haul passenger airport."""
+    """Anchorage is a long-haul cargo hub and a short-haul passenger airport."""
     def long_haul_share(*configs):
         where = f"AND aircraft_config IN ({','.join('?' * len(configs))})" if configs else ""
         long_haul, deps = db.execute(
@@ -292,3 +292,21 @@ def test_report_on_time_coverage_of_t100(db):
         total = scalar(db, "SELECT SUM(departures) FROM t100_month "
                            "WHERE airport = ? AND year = 2025", airport)
         print(f"  {airport}  {100 * departed / total:5.1f}%")
+
+
+# Metropolitan areas Census created, re-coded or retired in its 2023 definitions.
+# Their population series cannot span 2016 to 2024 under one code.
+REDEFINED_IN_2023 = {
+    "Cleveland, OH", "Bozeman, MT", "Helena, MT", "Minot, ND", "Paducah, KY-IL",
+    "Traverse City, MI", "New Bern, NC",
+}
+
+
+def test_every_matched_metro_has_the_full_population_series(db):
+    """Guards against the renamed-area defect: joining the two Census files by
+    name split each renamed area into two halves. Only areas Census actually
+    redefined may lack years."""
+    rows = db.execute("SELECT cbsa_name, COUNT(DISTINCT year) FROM metro_population "
+                      "GROUP BY city_market_id").fetchall()
+    partial = {name for name, years in rows if years != LAST_POPULATION_YEAR - FIRST_YEAR + 1}
+    assert partial <= REDEFINED_IN_2023

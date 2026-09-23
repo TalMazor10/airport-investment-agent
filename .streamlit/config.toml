@@ -1,0 +1,13 @@
+# Streamlit settings for this project, read when the app is started from this folder.
+
+[server]
+# Runs without the first-run email prompt and without opening a browser;
+# the app address is printed in the terminal.
+headless = true
+# Accepts connections from this computer only. Without it the app is reachable
+# from the local network, and anyone on it could use the configured API key.
+address = "localhost"
+
+[browser]
+# No usage statistics are sent to Streamlit.
+gatherUsageStats = false

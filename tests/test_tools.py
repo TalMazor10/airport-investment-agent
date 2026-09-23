@@ -83,4 +83,43 @@ def test_haul_mix_gives_the_anchorage_split():
     result = tools.haul_mix("ANC")
     assert result["all_flights"]["long_haul_pct"] == pytest.approx(41.7, abs=0.05)
     assert result["passenger_aircraft"]["long_haul_pct"] == pytest.approx(8.2, abs=0.05)
-    assert result["freighters"]["long_haul_pct"] == pytest.approx(68.3, abs=0.05)
+    assert result["cargo_aircraft"]["long_haul_pct"] == pytest.approx(68.3, abs=0.05)
+
+
+def test_each_term_states_its_direction_in_words():
+    """JFK loses share of its metropolitan area, and its passengers grow faster
+    than the area's population. The model misread both from signed values in the first live
+    test; the reading sentence states the direction for it."""
+    jfk = tools.score_airports(["JFK"])["airports"][0]["terms"]
+    assert jfk["spillover"]["reading"].startswith("Losing")
+    assert jfk["growth_gap"]["reading"].startswith("Passengers grew")
+    dfw = tools.score_airports(["DFW"])["airports"][0]["terms"]
+    assert dfw["growth_gap"]["reading"].startswith("Passengers grew")
+
+
+def test_sensitivity_lists_the_top_positions_in_rank_order_with_a_summary():
+    result = tools.score_airports(["JFK", "LGA", "EWR"])
+    order = [a["airport"] for a in result["airports"] if a.get("ranked")]
+    assert result["sensitivity"]["top_in_rank_order"] == order[:3]
+    assert result["sensitivity"]["summary"].startswith(("Stable", "Not stable"))
+
+
+def test_haul_mix_returns_each_aircraft_type_as_a_share_of_departures():
+    """Miami cargo aircraft are 13.5% of departures. The model computed this itself
+    in the first live test; the tool now returns it."""
+    result = tools.haul_mix("MIA")
+    assert result["cargo_aircraft"]["share_of_all_departures_pct"] == pytest.approx(13.5, abs=0.05)
+    assert result["all_flights"]["share_of_all_departures_pct"] == 100.0
+
+
+def test_the_profile_sets_delay_against_every_ranked_airport():
+    """SFO's delay is near the top nationally. Without this comparison the LLM
+    judged 5.5 minutes 'moderate' against SFO's own worse pre-pandemic years."""
+    comparison = tools.airport_profile("SFO")["nas_delay_national_comparison"]
+    assert comparison["national_percentile"] >= 95
+    assert comparison["minutes_per_arrival_2023_2025"] > comparison["national_median_minutes"]
+
+
+def test_percentiles_are_whole_numbers():
+    terms = tools.score_airports(["BOS", "BDL"])["airports"][0]["terms"]
+    assert all(isinstance(t["percentile"], int) for t in terms.values())
