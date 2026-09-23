@@ -6,33 +6,58 @@ data/airports.db, which is committed to the repository; the application reads
 that database directly and performs no downloads while serving queries.
 
 Sources, all public domain US government or Unlicense:
-    BTS On-Time Performance  one record per domestic flight
-    BTS T-100 Segment        passengers and seats per airport per month
-    OurAirports              airport names, cities, states, coordinates
+    BTS On-Time Performance          one record per domestic flight by carriers
+                                     above the BTS revenue reporting threshold:
+                                     delays, cancellations, departure hour
+    BTS T-100 Segment (All Carriers) every route flown by every carrier,
+                                     domestic and international, passenger and
+                                     freighter, with distance and aircraft
+                                     configuration
+    BTS T-100 Segment Summary        passengers, seats and departures per
+      by Origin Airport              airport per month
+    OurAirports                      airport names, cities, coordinates
+    US Census Population Estimates   annual population per metropolitan area
 
 Pipeline:
-    1. Download one archive per month from the BTS On-Time Performance set.
-    2. Stream each archive and aggregate to per-airport-per-month rows. The
+    1. Download one On-Time Performance archive per month.
+    2. Stream each archive and aggregate it to per-airport-per-month rows. The
        raw CSV is 286 MB and roughly 631,000 rows per month; 20 of its 110
-       columns are retained and at most one row is held in memory at a time.
-    3. Fetch T-100 passenger and seat counts from the BTS open data API.
-    4. Fetch airport metadata from OurAirports.
-    5. Write the result to SQLite.
+       columns are read and at most one row is held in memory at a time.
+    3. Download one T-100 Segment file per year and aggregate it to departures
+       per airport, month, aircraft configuration and distance band.
+    4. Fetch T-100 airport totals from the BTS open data API.
+    5. Fetch airport metadata from OurAirports.
+    6. Match airport markets to Census metropolitan areas and fetch population.
+    7. Write the result to SQLite.
 
 Usage:
-    python prepare_data.py                      # 2016 to present
+    python prepare_data.py                      # 2016 to 2025
     python prepare_data.py --years 2024 2025    # selected years only
     python prepare_data.py --skip-download      # rebuild from cache/
 
-COVID handling: 2020 and 2021 are downloaded and stored. They are excluded at
-query time rather than at ingest, which keeps the exclusion visible in the
-output, reversible, and controllable by the caller.
+Coverage window
+---------------
+The default window is the calendar years 2016 to 2025. The sources end in
+different months: On-Time Performance runs further than T-100, and Census
+population estimates end in 2024. A partial year compared against a full one
+shows every airport in decline, so the window ends at the last calendar year
+that is complete in every flight source. The missing 2025 population year is
+carried downstream as a stated assumption.
+
+Pandemic months
+---------------
+US air traffic collapsed in spring 2020 and recovered unevenly through 2021.
+Every month is stored as reported. How much each pandemic month counts in a
+trend is an analytical judgment, so the month weights are defined in the
+scoring module alongside the other scoring parameters, where they can be
+changed without rebuilding this database.
 """
 
 import argparse
 import csv
 import io
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -45,17 +70,53 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, "cache")
 DB_PATH = os.path.join(HERE, "data", "airports.db")
 
+DEFAULT_YEARS = list(range(2016, 2026))
+
 ONTIME_URL = (
     "https://transtats.bts.gov/PREZIP/"
     "On_Time_Reporting_Carrier_On_Time_Performance_1987_present_{year}_{month}.zip"
 )
+SEGMENT_FORM_URL = (
+    "https://transtats.bts.gov/DL_SelectFields.aspx"
+    "?gnoyr_VQ=FMG&QO_fu146_anzr=Nv4%20Pn44vr45"
+)
 T100_URL = "https://data.transportation.gov/resource/r495-tyji.json"
 OURAIRPORTS_URL = "https://davidmegginson.github.io/ourairports-data/airports.csv"
 
-# A flight is "long haul" at 6 hours or more. CRSElapsedTime is scheduled
-# minutes, so this is measured rather than estimated from distance.
-LONG_HAUL_MINUTES = 360
-MEDIUM_HAUL_MINUTES = 180
+# Census metropolitan population. The API requires a key; these flat files do
+# not, and they carry the same estimates. Two files are needed because Census
+# rebases the series after each decennial census.
+CENSUS_URLS = [
+    ("https://www2.census.gov/programs-surveys/popest/datasets/"
+     "2010-2019/metro/totals/cbsa-est2019-alldata.csv", range(2010, 2020)),
+    ("https://www2.census.gov/programs-surveys/popest/datasets/"
+     "2020-2024/metro/totals/cbsa-est2024-alldata.csv", range(2020, 2025)),
+]
+
+# Columns requested from the T-100 Segment download form. The form returns only
+# the columns selected.
+SEGMENT_FIELDS = [
+    "YEAR", "MONTH", "ORIGIN", "ORIGIN_COUNTRY",
+    "DISTANCE", "AIRCRAFT_CONFIG", "DEPARTURES_PERFORMED",
+]
+
+# Haul length is classified by the route distance T-100 publishes for each
+# segment, in statute miles.
+#
+# Distance is used rather than the flight time T-100 also carries, because
+# flight time is reported by US carriers only. Foreign carriers record zero
+# minutes: in 2025, 79 percent of LAX departures on routes of 2,700 miles or
+# more carry no flight time. A time threshold would classify most
+# international long-haul flights as short haul.
+#
+# 2,700 statute miles approximates six hours of block time at typical jet cruise
+# speed including taxi and climb. Six hours is the common industry threshold.
+#
+# Three bands rather than two: the threshold is a convention, not a physical
+# boundary, and a single long-haul percentage hides how much traffic sits just
+# below the line. The medium band makes that sensitivity visible.
+LONG_HAUL_MILES = 2700
+MEDIUM_HAUL_MILES = 1400
 
 # The five BTS delay-cause columns. NASDelay is the one that matters most:
 # BTS defines it as delay from airport operations, traffic volume, air traffic
@@ -83,7 +144,7 @@ def month_list(years):
 
 
 def download_month(year, month):
-    """Fetch one monthly zip into cache/. Returns the path, or None if absent.
+    """Fetch one monthly On-Time zip into cache/. Returns the path, or None.
 
     Files are skipped if already on disk, so the whole run is resumable.
     """
@@ -115,6 +176,55 @@ def download_month(year, month):
     return path
 
 
+def download_segments(year):
+    """Fetch one year of T-100 Segment (All Carriers) into cache/.
+
+    This table is not published on the BTS open data API. TranStats serves it
+    through an ASP.NET download form, so the request replays that form: a GET
+    collects the hidden state fields the form requires, and a POST with the
+    year and column selection returns a zip. A form can change without notice,
+    which a static file URL does not, so every download is cached and a
+    rebuild from cache never contacts the form.
+
+    Returns the path, or None if the year is not available.
+    """
+    path = os.path.join(CACHE, f"t100_segment_{year}.zip")
+    if os.path.exists(path) and os.path.getsize(path) > 100_000:
+        return path
+
+    session = requests.Session()
+    try:
+        page = session.get(SEGMENT_FORM_URL, timeout=120)
+        page.raise_for_status()
+        hidden = dict(re.findall(
+            r'<input type="hidden" name="([^"]+)" id="[^"]*" value="([^"]*)"', page.text))
+        form = {
+            **hidden,
+            "cboGeography": "All",
+            "cboYear": str(year),
+            "cboPeriod": "All",
+            "chkDownloadZip": "on",
+            "btnDownload": "Download",
+        }
+        form.update({field: "on" for field in SEGMENT_FIELDS})
+        r = session.post(SEGMENT_FORM_URL, data=form, timeout=600)
+    except requests.RequestException as e:
+        print(f"  segments {year}  network error: {e}")
+        return None
+
+    if r.status_code != 200 or r.content[:2] != b"PK":
+        print(f"  segments {year}  not available (HTTP {r.status_code}, "
+              f"{r.headers.get('Content-Type')})")
+        return None
+
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(r.content)
+    os.replace(tmp, path)
+    print(f"  segments {year}  downloaded {len(r.content)/1e6:5.1f} MB")
+    return path
+
+
 # ----------------------------------------------------------------------------
 # 2. Aggregate
 # ----------------------------------------------------------------------------
@@ -128,11 +238,6 @@ def new_bucket():
         "dep_del15": 0,
         "dep_delay_min": 0.0,
         "arr_delay_min": 0.0,
-        "distance_sum": 0.0,
-        "elapsed_sum": 0.0,
-        "long_haul": 0,
-        "medium_haul": 0,
-        "short_haul": 0,
         "city_market_id": "",
         "state": "",
     }
@@ -153,9 +258,10 @@ def fnum(row, key):
 
 
 def aggregate_month(zip_path):
-    """Stream one monthly zip and return three aggregates.
+    """Stream one monthly On-Time zip and return three aggregates.
 
-    by_origin : per departing airport, all retained measures
+    by_origin : per departing airport: flights, cancellations, diversions,
+                delay minutes by cause, metro market and state.
     by_dest   : per arriving airport, delay causes only. The BTS delay-cause
                 columns describe ARRIVAL delay, so grouping them by origin
                 attributes congestion at the destination to the wrong airport.
@@ -164,6 +270,10 @@ def aggregate_month(zip_path):
     by_hour   : per airport per departure-hour block, flight counts only.
                 Terminal congestion is a peak-hour effect and is not visible
                 in an annual average.
+
+    Flight distance is not taken from this source. On-Time Performance covers
+    domestic passenger flights only; distance comes from T-100 Segment, which
+    covers every flight.
     """
     by_origin = defaultdict(new_bucket)
     by_dest = defaultdict(lambda: {c: 0.0 for c in DELAY_CAUSES} | {"flights": 0})
@@ -189,19 +299,8 @@ def aggregate_month(zip_path):
                 b["dep_del15"] += int(fnum(row, "DepDel15"))
                 b["dep_delay_min"] += fnum(row, "DepDelayMinutes")
                 b["arr_delay_min"] += fnum(row, "ArrDelayMinutes")
-                b["distance_sum"] += fnum(row, "Distance")
                 for c in DELAY_CAUSES:
                     b[c] += fnum(row, c)
-
-                # Scheduled duration drives the long-haul split.
-                elapsed = fnum(row, "CRSElapsedTime")
-                b["elapsed_sum"] += elapsed
-                if elapsed >= LONG_HAUL_MINUTES:
-                    b["long_haul"] += 1
-                elif elapsed >= MEDIUM_HAUL_MINUTES:
-                    b["medium_haul"] += 1
-                else:
-                    b["short_haul"] += 1
 
                 if not b["city_market_id"]:
                     b["city_market_id"] = row.get("OriginCityMarketID") or ""
@@ -220,16 +319,59 @@ def aggregate_month(zip_path):
     return by_origin, by_dest, by_hour
 
 
+def aggregate_segments(zip_path):
+    """Aggregate one year of T-100 Segment to departures by distance band.
+
+    Key: (year, month, origin airport, aircraft configuration code).
+
+    AIRCRAFT_CONFIG is stored as the code BTS publishes:
+        1  passenger
+        2  freighter
+        3  combined passenger and freight on the main deck
+        4  seaplane
+    Grouping codes into passenger and freighter service is left to the code
+    that reads the database, so the stored figures remain exactly as reported.
+
+    Only departures from US airports are kept. The source also lists segments
+    flown from foreign airports into the United States.
+    """
+    out = defaultdict(lambda: {"departures": 0.0, "long": 0.0, "medium": 0.0, "short": 0.0})
+    with zipfile.ZipFile(zip_path) as z:
+        inner = next(n for n in z.namelist() if n.upper().startswith("T_T100"))
+        with z.open(inner) as fh:
+            reader = csv.DictReader(io.TextIOWrapper(fh, encoding="utf-8", errors="ignore"))
+            for row in reader:
+                if row.get("ORIGIN_COUNTRY") != "US":
+                    continue
+                deps = fnum(row, "DEPARTURES_PERFORMED")
+                if deps == 0:
+                    continue
+                key = (int(row["YEAR"]), int(row["MONTH"]), row["ORIGIN"],
+                       int(fnum(row, "AIRCRAFT_CONFIG")))
+                a = out[key]
+                a["departures"] += deps
+                miles = fnum(row, "DISTANCE")
+                if miles >= LONG_HAUL_MILES:
+                    a["long"] += deps
+                elif miles >= MEDIUM_HAUL_MILES:
+                    a["medium"] += deps
+                else:
+                    a["short"] += deps
+    return out
+
+
 # ----------------------------------------------------------------------------
-# 3. Reference data from public APIs
+# 3. Reference data
 # ----------------------------------------------------------------------------
 
 def fetch_t100():
     """T-100 passengers, seats and departures, per airport per month.
 
-    The passenger-volume source. On-Time Performance counts flights rather than
-    people, and covers only carriers above the BTS reporting threshold, so the
-    two datasets have different coverage. See DESIGN.md.
+    The passenger-volume source, and the independent reference that the
+    route-level T-100 Segment totals are reconciled against. On-Time Performance
+    counts flights rather than people, and covers only carriers above the BTS
+    reporting threshold, so the two datasets have different coverage. See
+    DESIGN.md.
     """
     rows = []
     offset = 0
@@ -255,14 +397,18 @@ def fetch_t100():
 
 
 def fetch_airports():
-    """Airport names, cities, states and coordinates. Public domain (Unlicense)."""
-    r = requests.get(OURAIRPORTS_URL, timeout=120)
+    """Airport names, cities, coordinates and country.
+
+    Every airport holding an IATA code is kept, worldwide. OurAirports lists US
+    territories such as Puerto Rico and Guam under their own country codes, so
+    a filter on the United States would drop airports that BTS reports as
+    domestic.
+    """
+    r = requests.get(OURAIRPORTS_URL, timeout=180)
     r.raise_for_status()
     reader = csv.DictReader(io.StringIO(r.text))
     out = []
     for row in reader:
-        if row.get("iso_country") != "US":
-            continue
         code = (row.get("iata_code") or "").strip()
         if not code:
             continue
@@ -270,6 +416,7 @@ def fetch_airports():
             "code": code,
             "name": row.get("name") or "",
             "city": row.get("municipality") or "",
+            "country": row.get("iso_country") or "",
             "region": (row.get("iso_region") or "").replace("US-", ""),
             "lat": row.get("latitude_deg") or "",
             "lon": row.get("longitude_deg") or "",
@@ -278,25 +425,84 @@ def fetch_airports():
     return out
 
 
+def _normalise_place(text):
+    """Reduce a place name to a comparable form."""
+    text = text.lower().replace(".", "").replace("saint ", "st ")
+    return re.sub(r"[^a-z0-9 ]", " ", text)
+
+
+def fetch_metro_population(market_cities, years):
+    """Annual population for the metropolitan area around each airport market.
+
+    This is the reference for the growth-gap measure: an airport whose traffic
+    is flat while its region grows is the pattern the ranking is looking for.
+
+    Census identifies metropolitan areas by CBSA code and BTS identifies them by
+    city market id, and no published crosswalk links the two. They are matched
+    on place name and state instead: an airport's city is compared against the
+    component names of each CBSA in the same state, taking the shortest match so
+    that "Ontario, CA" resolves to Ontario rather than to a larger area that
+    merely contains the word.
+
+    Coverage is partial by construction. Roughly two thirds of airport markets
+    match, accounting for about 95 percent of flight volume. The remainder are
+    mostly Hawaii, Puerto Rico and resort destinations that Census either names
+    differently or does not classify as metropolitan areas. Unmatched markets
+    have no population record in the database.
+
+    market_cities: {city_market_id: (city, state_code)}
+    years:         years to keep; Census publishes nothing after 2024
+    returns: {city_market_id: {"cbsa": name, "pop": {year: population}}}
+    """
+    wanted = set(years)
+    metros = {}
+    for url, census_years in CENSUS_URLS:
+        r = requests.get(url, timeout=180)
+        r.raise_for_status()
+        for row in csv.DictReader(io.StringIO(r.text)):
+            if row.get("LSAD") != "Metropolitan Statistical Area":
+                continue
+            name = row["NAME"]
+            pops = {y: int(row[f"POPESTIMATE{y}"])
+                    for y in census_years
+                    if y in wanted and (row.get(f"POPESTIMATE{y}") or "").isdigit()}
+            metros.setdefault(name, {}).update(pops)
+
+    index = []
+    for name in metros:
+        head, states = name.rsplit(",", 1)
+        index.append((name, _normalise_place(head), set(states.strip().split("-"))))
+
+    out = {}
+    for market, (city, state) in market_cities.items():
+        tokens = [_normalise_place(t).strip() for t in re.split(r"[-/]", city) if t.strip()]
+        best = None
+        for name, head, states in index:
+            if state not in states:
+                continue
+            if any(t and t in head for t in tokens):
+                if best is None or len(head) < len(best[1]):
+                    best = (name, head)
+        if best:
+            out[market] = {"cbsa": best[0], "pop": metros[best[0]]}
+    return out
+
+
 # ----------------------------------------------------------------------------
 # 4. Write the database
 # ----------------------------------------------------------------------------
 
 SCHEMA = """
-DROP TABLE IF EXISTS airport_month;
 CREATE TABLE airport_month (
     year INTEGER, month INTEGER, airport TEXT,
     flights INTEGER, cancelled INTEGER, diverted INTEGER,
     dep_del15 INTEGER, dep_delay_min REAL, arr_delay_min REAL,
     carrier_delay REAL, weather_delay REAL, nas_delay REAL,
     security_delay REAL, late_aircraft_delay REAL,
-    distance_sum REAL, elapsed_sum REAL,
-    long_haul INTEGER, medium_haul INTEGER, short_haul INTEGER,
     city_market_id TEXT, state TEXT,
     PRIMARY KEY (year, month, airport)
 );
 
-DROP TABLE IF EXISTS arrival_delay_month;
 CREATE TABLE arrival_delay_month (
     year INTEGER, month INTEGER, airport TEXT, flights INTEGER,
     carrier_delay REAL, weather_delay REAL, nas_delay REAL,
@@ -304,13 +510,17 @@ CREATE TABLE arrival_delay_month (
     PRIMARY KEY (year, month, airport)
 );
 
-DROP TABLE IF EXISTS peak_hour;
 CREATE TABLE peak_hour (
     year INTEGER, airport TEXT, dep_time_block TEXT, flights INTEGER,
     PRIMARY KEY (year, airport, dep_time_block)
 );
 
-DROP TABLE IF EXISTS t100_month;
+CREATE TABLE haul_month (
+    year INTEGER, month INTEGER, airport TEXT, aircraft_config INTEGER,
+    departures INTEGER, long_haul INTEGER, medium_haul INTEGER, short_haul INTEGER,
+    PRIMARY KEY (year, month, airport, aircraft_config)
+);
+
 CREATE TABLE t100_month (
     year INTEGER, month INTEGER, airport TEXT,
     departures REAL, passengers REAL, seats REAL,
@@ -318,40 +528,53 @@ CREATE TABLE t100_month (
     PRIMARY KEY (year, month, airport)
 );
 
-DROP TABLE IF EXISTS airports;
+CREATE TABLE metro_population (
+    city_market_id TEXT, year INTEGER, population INTEGER, cbsa_name TEXT,
+    PRIMARY KEY (city_market_id, year)
+);
+
 CREATE TABLE airports (
-    code TEXT PRIMARY KEY, name TEXT, city TEXT, region TEXT,
+    code TEXT PRIMARY KEY, name TEXT, city TEXT, country TEXT, region TEXT,
     lat REAL, lon REAL, type TEXT
 );
 
 CREATE INDEX idx_am_airport ON airport_month(airport);
 CREATE INDEX idx_am_year ON airport_month(year);
-CREATE INDEX idx_t100_airport ON t100_month(airport);
 CREATE INDEX idx_am_market ON airport_month(city_market_id);
+CREATE INDEX idx_haul_airport ON haul_month(airport);
+CREATE INDEX idx_t100_airport ON t100_month(airport);
 """
 
 
-def write_db(by_origin, by_dest, by_hour, t100, airports):
+def write_db(by_origin, by_dest, by_hour, segments, t100, airports, metros, years):
+    """Write every table to a new database file, then swap it into place.
+
+    Building a fresh file guarantees that tables removed from the schema do not
+    survive from an earlier build, and a build that fails part-way leaves the
+    previous database untouched.
+    """
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    tmp_path = DB_PATH + ".tmp"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    con = sqlite3.connect(tmp_path)
     con.executescript(SCHEMA)
+    year_set = set(years)
 
     con.executemany(
-        "INSERT OR REPLACE INTO airport_month VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO airport_month VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             (y, m, a, b["flights"], b["cancelled"], b["diverted"], b["dep_del15"],
              b["dep_delay_min"], b["arr_delay_min"],
              b["CarrierDelay"], b["WeatherDelay"], b["NASDelay"],
              b["SecurityDelay"], b["LateAircraftDelay"],
-             b["distance_sum"], b["elapsed_sum"],
-             b["long_haul"], b["medium_haul"], b["short_haul"],
              b["city_market_id"], b["state"])
             for (y, m, a), b in by_origin.items()
         ],
     )
 
     con.executemany(
-        "INSERT OR REPLACE INTO arrival_delay_month VALUES (?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO arrival_delay_month VALUES (?,?,?,?,?,?,?,?,?)",
         [
             (y, m, a, d["flights"], d["CarrierDelay"], d["WeatherDelay"],
              d["NASDelay"], d["SecurityDelay"], d["LateAircraftDelay"])
@@ -360,8 +583,17 @@ def write_db(by_origin, by_dest, by_hour, t100, airports):
     )
 
     con.executemany(
-        "INSERT OR REPLACE INTO peak_hour VALUES (?,?,?,?)",
+        "INSERT INTO peak_hour VALUES (?,?,?,?)",
         [(y, a, blk, n) for (y, a, blk), n in by_hour.items()],
+    )
+
+    con.executemany(
+        "INSERT INTO haul_month VALUES (?,?,?,?,?,?,?,?)",
+        [
+            (y, m, a, cfg, round(v["departures"]), round(v["long"]),
+             round(v["medium"]), round(v["short"]))
+            for (y, m, a, cfg), v in segments.items()
+        ],
     )
 
     con.executemany(
@@ -373,24 +605,36 @@ def write_db(by_origin, by_dest, by_hour, t100, airports):
              float(r.get("outbound_international_1") or 0))
             for r in t100
             if r.get("origin_airport_code") and r.get("year") and r.get("reporting_month")
+            and int(r["year"]) in year_set
         ],
     )
 
     con.executemany(
-        "INSERT OR REPLACE INTO airports VALUES (?,?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO airports VALUES (?,?,?,?,?,?,?,?)",
         [
-            (a["code"], a["name"], a["city"], a["region"],
+            (a["code"], a["name"], a["city"], a["country"], a["region"],
              float(a["lat"] or 0), float(a["lon"] or 0), a["type"])
             for a in airports
         ],
     )
 
+    con.executemany(
+        "INSERT INTO metro_population VALUES (?,?,?,?)",
+        [
+            (market, year, pop, info["cbsa"])
+            for market, info in metros.items()
+            for year, pop in info["pop"].items()
+        ],
+    )
+
     con.commit()
-    for t in ("airport_month", "arrival_delay_month", "peak_hour", "t100_month", "airports"):
+    for t in ("airport_month", "arrival_delay_month", "peak_hour", "haul_month",
+              "t100_month", "metro_population", "airports"):
         n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         print(f"  {t:<22} {n:>9,} rows")
     con.execute("VACUUM")
     con.close()
+    os.replace(tmp_path, DB_PATH)
     print(f"\ndatabase written: {DB_PATH}  ({os.path.getsize(DB_PATH)/1e6:.1f} MB)")
 
 
@@ -398,9 +642,9 @@ def write_db(by_origin, by_dest, by_hour, t100, airports):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--years", nargs="+", type=int,
-                   default=list(range(2016, 2027)),
-                   help="years to include (2020 and 2021 are kept, and excluded at query time)")
+    p.add_argument("--years", nargs="+", type=int, default=DEFAULT_YEARS,
+                   help="calendar years to include (default 2016 to 2025, the last "
+                        "year complete in every flight source)")
     p.add_argument("--skip-download", action="store_true",
                    help="rebuild the database from files already in cache/")
     args = p.parse_args()
@@ -411,7 +655,7 @@ def main():
     print(f"Building from {min(args.years)} to {max(args.years)}\n")
 
     paths = []
-    print("STEP 1: download")
+    print("STEP 1: download On-Time Performance")
     for year, month in month_list(args.years):
         if args.skip_download:
             pth = os.path.join(CACHE, f"ontime_{year}_{month:02d}.zip")
@@ -423,7 +667,7 @@ def main():
                 paths.append(pth)
     print(f"  {len(paths)} monthly files ready\n")
 
-    print("STEP 2: aggregate")
+    print("STEP 2: aggregate On-Time Performance")
     by_origin, by_dest, by_hour = defaultdict(new_bucket), defaultdict(
         lambda: {c: 0.0 for c in DELAY_CAUSES} | {"flights": 0}), defaultdict(int)
     for i, pth in enumerate(paths, 1):
@@ -442,16 +686,52 @@ def main():
               f"{len(by_origin):,} airport-months so far")
     print()
 
-    print("STEP 3: T-100 passenger data")
+    print("STEP 3: T-100 Segment, route distances for every carrier")
+    segments = defaultdict(lambda: {"departures": 0.0, "long": 0.0, "medium": 0.0, "short": 0.0})
+    for year in args.years:
+        if args.skip_download:
+            pth = os.path.join(CACHE, f"t100_segment_{year}.zip")
+            pth = pth if os.path.exists(pth) else None
+        else:
+            pth = download_segments(year)
+        if not pth:
+            continue
+        for k, v in aggregate_segments(pth).items():
+            tgt = segments[k]
+            for f, val in v.items():
+                tgt[f] += val
+    print(f"  {len(segments):,} airport-month-configuration rows\n")
+
+    print("STEP 4: T-100 airport totals")
     t100 = fetch_t100()
     print()
 
-    print("STEP 4: airport metadata")
+    print("STEP 5: airport metadata")
     airports = fetch_airports()
-    print(f"  {len(airports):,} US airports\n")
+    us = sum(1 for a in airports if a["country"] == "US")
+    print(f"  {len(airports):,} airports with an IATA code ({us:,} in the US)\n")
 
-    print("STEP 5: write database")
-    write_db(by_origin, by_dest, by_hour, t100, airports)
+    print("STEP 6: metropolitan population")
+    city_of = {a["code"]: (a["city"], a["region"]) for a in airports}
+    biggest = {}
+    for (y, m, apt), b in by_origin.items():
+        mkt = b["city_market_id"]
+        if not mkt:
+            continue
+        cur = biggest.get(mkt)
+        if cur is None or b["flights"] > cur[1]:
+            biggest[mkt] = (apt, b["flights"])
+    market_cities = {
+        mkt: city_of[apt] for mkt, (apt, _) in biggest.items() if apt in city_of
+    }
+    metros = fetch_metro_population(market_cities, args.years)
+    matched = len(metros)
+    print(f"  {matched:,} of {len(market_cities):,} airport markets matched to a "
+          f"Census metropolitan area ({matched/max(len(market_cities),1)*100:.0f}%)")
+    print("  unmatched markets have no population record\n")
+
+    print("STEP 7: write database")
+    write_db(by_origin, by_dest, by_hour, segments, t100, airports, metros, args.years)
     print(f"\ntotal time: {(time.time()-t_start)/60:.1f} minutes")
 
 

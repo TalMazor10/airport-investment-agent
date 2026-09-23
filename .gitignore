@@ -27,3 +27,6 @@ Thumbs.db
 
 # data/airports.db is intentionally NOT ignored. It is the aggregated build
 # output and is committed so the application runs without a download step.
+
+# Unreviewed drafts, not part of the project
+_drafts/
