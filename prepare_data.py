@@ -475,7 +475,8 @@ def fetch_metro_population(market_cities, years):
 
     out = {}
     for market, (city, state) in market_cities.items():
-        tokens = [_normalise_place(t).strip() for t in re.split(r"[-/]", city) if t.strip()]
+        # OurAirports cities may carry a qualifier after a comma, e.g. "Honolulu, Oahu".
+        tokens = [_normalise_place(t).strip() for t in re.split(r"[-/,]", city) if t.strip()]
         best = None
         for name, head, states in index:
             if state not in states:

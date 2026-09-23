@@ -220,6 +220,17 @@ def test_2025_passengers_match_the_published_figures(db, airport, passengers):
     assert stored == passengers
 
 
+def test_honolulu_matches_its_census_metropolitan_area(db):
+    """OurAirports names the city "Honolulu, Oahu"; the qualifier after the
+    comma must not prevent the Census match."""
+    cbsa = scalar(db, """
+        SELECT DISTINCT p.cbsa_name FROM metro_population p
+        JOIN airport_month a ON a.city_market_id = p.city_market_id
+        WHERE a.airport = 'HNL'
+    """)
+    assert cbsa == "Urban Honolulu, HI"
+
+
 def test_2020_shows_the_pandemic_collapse(db):
     """Domestic flights fell 36.8 percent from 2019 to 2020."""
     y2019 = scalar(db, "SELECT SUM(flights) FROM airport_month WHERE year = 2019")
